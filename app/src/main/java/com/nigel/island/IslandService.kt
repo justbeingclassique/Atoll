@@ -21,6 +21,7 @@ import android.graphics.Matrix
 import android.graphics.Outline
 import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.RadialGradient
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Shader
@@ -62,6 +63,7 @@ import android.widget.TextView
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.exp
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
 
@@ -98,23 +100,20 @@ class WaveView(ctx: Context) : View(ctx) {
     }
 }
 
-/** The island body: glossy 3D black glass with a flowing colour rim. */
+/** The island body: glossy solid black when small, liquid glass when expanded. */
 class PillView(ctx: Context) : FrameLayout(ctx) {
     var radius = 0f
-    var rimSpan = 1000f
-    var rimColors: IntArray = intArrayOf(0xFF00E5FF.toInt(), 0xFFB14DFF.toInt(), 0xFFFF4D8D.toInt(), 0xFF00E5FF.toInt())
-        set(v) { field = v; rimShader = null; invalidate() }
-    var phase = 0f
+    var glass = 0f
+        set(v) { field = v; invalidate() }
+    var tint = 0
+        set(v) { field = v; invalidate() }
+    var blurOn = false
         set(v) { field = v; invalidate() }
 
-    private val body = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val rim = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
-    private val gloss = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; color = 0x66FFFFFF }
+    private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val layer = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val edge = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val streak = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x30FFFFFF }
-    private var rimShader: LinearGradient? = null
-    private var bodyShader: LinearGradient? = null
-    private var bodyH = -1f
-    private val m = Matrix()
     private val r = RectF()
 
     init { setWillNotDraw(false) }
@@ -124,37 +123,71 @@ class PillView(ctx: Context) : FrameLayout(ctx) {
         val h = height.toFloat()
         if (w <= 0f || h <= 0f) return
         val d = resources.displayMetrics.density
+        val g = glass.coerceIn(0f, 1f)
 
-        // body: lighter top fading to deep black = a little depth
-        val ge = min(h, 60f * d)
-        if (bodyShader == null || bodyH != ge) {
-            bodyShader = LinearGradient(0f, 0f, 0f, ge, 0xFF30303A.toInt(), Color.BLACK, Shader.TileMode.CLAMP)
-            bodyH = ge
-        }
-        body.shader = bodyShader
+        // base: solid black when small, see-through dark glass when big
+        val glassAlpha = if (blurOn) 150 else 225
+        fill.color = Color.argb((255 + (glassAlpha - 255) * g).toInt(), 8, 10, 16)
         r.set(0f, 0f, w, h)
-        c.drawRoundRect(r, radius, radius, body)
+        c.drawRoundRect(r, radius, radius, fill)
 
-        // flowing colour rim
-        val sw = 1.6f * d
-        val rs = rimShader ?: LinearGradient(0f, 0f, rimSpan, 0f, rimColors, null, Shader.TileMode.REPEAT).also { rimShader = it }
-        m.setTranslate(phase * rimSpan, 0f)
-        rs.setLocalMatrix(m)
-        rim.shader = rs
-        rim.strokeWidth = sw
+        // small-pill gloss (a little depth)
+        if (g < 0.98f) {
+            layer.shader = LinearGradient(0f, 0f, 0f, min(h, 30f * d), 0xFF34343E.toInt(), 0x0034343E, Shader.TileMode.CLAMP)
+            layer.alpha = (255 * (1f - g)).toInt()
+            c.drawRoundRect(r, radius, radius, layer)
+        }
+
+        if (g > 0.02f) {
+            // diagonal sheen across the glass
+            layer.shader = LinearGradient(
+                0f, 0f, w, h,
+                intArrayOf(0x44FFFFFF, 0x08FFFFFF, 0x1AFFFFFF), floatArrayOf(0f, 0.55f, 1f), Shader.TileMode.CLAMP
+            )
+            layer.alpha = (255 * g).toInt()
+            c.drawRoundRect(r, radius, radius, layer)
+
+            // colour tint from whatever is playing or happening
+            if (tint != 0) {
+                val t = tint
+                layer.shader = LinearGradient(
+                    0f, 0f, 0f, h,
+                    Color.argb(0, Color.red(t), Color.green(t), Color.blue(t)),
+                    Color.argb(95, Color.red(t), Color.green(t), Color.blue(t)),
+                    Shader.TileMode.CLAMP
+                )
+                layer.alpha = (255 * g).toInt()
+                c.drawRoundRect(r, radius, radius, layer)
+            }
+
+            // specular glow in the top-left corner
+            layer.shader = RadialGradient(w * 0.15f, 0f, max(w, h) * 0.55f, 0x40FFFFFF, 0x00FFFFFF, Shader.TileMode.CLAMP)
+            layer.alpha = (255 * g).toInt()
+            c.drawRoundRect(r, radius, radius, layer)
+        }
+
+        // glass edge: bright top-left, soft middle, gentle bottom-right
+        val sw = 1.3f * d
+        edge.strokeWidth = sw
+        edge.shader = LinearGradient(
+            0f, 0f, w, h,
+            intArrayOf(0xCCFFFFFF.toInt(), 0x1AFFFFFF, 0x66FFFFFF), floatArrayOf(0f, 0.5f, 1f), Shader.TileMode.CLAMP
+        )
+        edge.alpha = (255 * (0.45f + 0.55f * g)).toInt()
         r.set(sw / 2, sw / 2, w - sw / 2, h - sw / 2)
-        c.drawRoundRect(r, radius - sw / 2, radius - sw / 2, rim)
+        c.drawRoundRect(r, max(radius - sw / 2, 0f), max(radius - sw / 2, 0f), edge)
 
-        // glossy top edge
-        c.save()
-        c.clipRect(0f, 0f, w, h * 0.45f)
-        gloss.strokeWidth = d
-        r.set(sw + d * 0.5f, sw + d * 0.5f, w - sw - d * 0.5f, h - sw - d * 0.5f)
-        c.drawRoundRect(r, radius - sw, radius - sw, gloss)
-        c.restore()
+        // faint inner edge
+        if (g > 0.02f) {
+            edge.shader = null
+            edge.strokeWidth = d
+            edge.color = Color.argb((26 * g).toInt(), 255, 255, 255)
+            r.set(sw + d, sw + d, w - sw - d, h - sw - d)
+            c.drawRoundRect(r, max(radius - sw - d, 0f), max(radius - sw - d, 0f), edge)
+        }
 
-        // soft specular streak (only on the small pill)
-        if (h < 80f * d) {
+        // soft specular streak on the small pill
+        if (g < 0.5f && h < 80f * d) {
             val sh = 2f * d
             r.set(h * 0.5f, sw + 2f * d, w - h * 0.5f, sw + 2f * d + sh)
             c.drawRoundRect(r, sh / 2, sh / 2, streak)
@@ -172,6 +205,7 @@ class IslandService : Service() {
         const val SIDE_MM = 10f         // millimetres the pill extends each side of the camera (10 = 1 cm)
         const val GROW = 26             // dp: extra width when something is showing
         const val PAD = 1               // dp: pill is this much bigger than the camera hole
+        const val Y_NUDGE = 0           // dp: move the whole island down (+) or up (-) if it is not lined up
         const val NOTIF_MS = 4500L
         const val CHARGE_MS = 3500L
         const val EXPAND_TIMEOUT = 12000L
@@ -202,9 +236,8 @@ class IslandService : Service() {
     private var content: View? = null
     private var contentKey = ""
     private var visibleOk = true
-    private var screenOn = true
-    private var rimPhase = 0f
-    private var rimKey = ""
+    private var blurApplied = false
+    private var blurSupported = false
 
     private var kind = Kind.NONE
     private var expanded = false
@@ -254,22 +287,9 @@ class IslandService : Service() {
             }
         }
     }
-    private val rimTick = object : Runnable {
-        override fun run() {
-            rimPhase = (rimPhase + 0.004f) % 1f
-            pill.phase = rimPhase
-            if (screenOn && visibleOk) handler.postDelayed(this, 33)
-        }
-    }
 
     private val chargeReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, i: Intent?) { onPowerConnected() }
-    }
-    private val screenReceiver = object : BroadcastReceiver() {
-        override fun onReceive(c: Context?, i: Intent?) {
-            screenOn = i?.action == Intent.ACTION_SCREEN_ON
-            startRim()
-        }
     }
 
     private val mediaCb = object : MediaController.Callback() {
@@ -305,7 +325,6 @@ class IslandService : Service() {
         )
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         vib = getSystemService(Vibrator::class.java)
-        screenOn = getSystemService(PowerManager::class.java)?.isInteractive ?: true
         gestures = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean = true
             override fun onSingleTapUp(e: MotionEvent): Boolean { onTap(); return true }
@@ -324,14 +343,9 @@ class IslandService : Service() {
         readCutout()
         buildPill()
         registerReceiver(chargeReceiver, IntentFilter(Intent.ACTION_POWER_CONNECTED))
-        registerReceiver(screenReceiver, IntentFilter().apply {
-            addAction(Intent.ACTION_SCREEN_ON)
-            addAction(Intent.ACTION_SCREEN_OFF)
-        })
         refreshMedia()
         registerCall()
         render(false)
-        startRim()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -351,7 +365,6 @@ class IslandService : Service() {
             contentKey = ""
             render(false)
         }
-        startRim()
         updateBubble()
     }
 
@@ -360,7 +373,6 @@ class IslandService : Service() {
         handler.removeCallbacksAndMessages(null)
         artAnim?.cancel()
         try { unregisterReceiver(chargeReceiver) } catch (_: Exception) {}
-        try { unregisterReceiver(screenReceiver) } catch (_: Exception) {}
         try { controller?.unregisterCallback(mediaCb) } catch (_: Exception) {}
         try {
             sessionsListener?.let { getSystemService(MediaSessionManager::class.java).removeOnActiveSessionsChangedListener(it) }
@@ -371,25 +383,37 @@ class IslandService : Service() {
         super.onDestroy()
     }
 
-    private fun startRim() {
-        handler.removeCallbacks(rimTick)
-        if (screenOn && visibleOk) handler.post(rimTick)
-    }
-
     // ---------------------------------------------------------------- window
 
     private fun readCutout() {
-        var r: Rect? = null
+        var hole: RectF? = null
         try {
             val d = getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY)
-            r = d?.cutout?.boundingRects?.firstOrNull()
+            val cut = d?.cutout
+            // best source: the exact shape of the camera hole
+            val path = cut?.cutoutPath
+            if (path != null) {
+                val b = RectF()
+                path.computeBounds(b, true)
+                if (b.width() > 0f && b.height() > 0f && b.width() < dp(80)) hole = b
+            }
+            // fallback: the cutout box usually runs from the very top of the screen down to the
+            // bottom of the camera, so assume a round hole sitting at the bottom of that box
+            if (hole == null) {
+                val rect = cut?.boundingRects?.firstOrNull()
+                if (rect != null && rect.width() > 0) {
+                    val hh = min(rect.height(), rect.width()).toFloat()
+                    hole = RectF(rect.left.toFloat(), rect.bottom - hh, rect.right.toFloat(), rect.bottom.toFloat())
+                }
+            }
         } catch (_: Exception) {}
-        if (r != null && r.width() > 0) {
-            cutW = r.width() + dp(PAD * 2)
-            cutH = r.height() + dp(PAD * 2)
-            cutTop = (r.top - dp(PAD)).coerceAtLeast(0)
+        val hb = hole
+        if (hb != null) {
+            cutW = hb.width().toInt() + dp(PAD * 2)
+            cutH = hb.height().toInt() + dp(PAD * 2)
+            cutTop = (hb.top.toInt() - dp(PAD) + dp(Y_NUDGE)).coerceAtLeast(0)
         } else {
-            cutW = dp(30); cutH = dp(30); cutTop = dp(8)
+            cutW = dp(30); cutH = dp(30); cutTop = dp(10) + dp(Y_NUDGE)
         }
     }
 
@@ -414,7 +438,6 @@ class IslandService : Service() {
         curRadius = radiusFor(cutH)
         pill = PillView(this).apply {
             radius = curRadius
-            rimSpan = resources.displayMetrics.widthPixels.toFloat()
             clipToOutline = true
             outlineProvider = object : ViewOutlineProvider() {
                 override fun getOutline(v: View, o: Outline) {
@@ -426,13 +449,26 @@ class IslandService : Service() {
         wm.addView(pill, lp)
     }
 
-    private fun radiusFor(h: Int) = min(h / 2f, dp(44).toFloat())
+    private fun radiusFor(h: Int) = min(h / 2f, dp(14).toFloat())
 
     private fun setSize(w: Int, h: Int) {
         lp.width = w.coerceAtLeast(idleW())
         lp.height = h.coerceAtLeast(cutH)
         curRadius = radiusFor(lp.height)
         pill.radius = curRadius
+        pill.glass = ((lp.height - cutH).toFloat() / dp(70)).coerceIn(0f, 1f)
+        val wantBlur = blurSupported && lp.height > cutH + dp(50)
+        if (wantBlur != blurApplied) {
+            blurApplied = wantBlur
+            if (wantBlur) {
+                lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
+                lp.blurBehindRadius = dp(26)
+            } else {
+                lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
+                lp.blurBehindRadius = 0
+            }
+            pill.blurOn = wantBlur
+        }
         try { wm.updateViewLayout(pill, lp) } catch (_: Exception) {}
         pill.invalidateOutline()
         positionBubble()
@@ -565,6 +601,7 @@ class IslandService : Service() {
     private fun isPlaying() = controller?.playbackState?.state == PlaybackState.STATE_PLAYING
 
     private fun render(animate: Boolean = true) {
+        blurSupported = try { wm.isCrossWindowBlurEnabled } catch (_: Exception) { false }
         val k = when {
             callState == 1 -> Kind.CALL_RING
             notif != null -> Kind.NOTIF
@@ -589,7 +626,7 @@ class IslandService : Service() {
             val v: View? = if (k == Kind.NONE && !showTray()) null else buildContent(k, exp)
             swap(v, w, h, animate)
         }
-        applyRim(k)
+        applyTint(k)
         animateTo(w, h, animate)
         updateMediaDynamic()
         updateBubble()
@@ -600,24 +637,12 @@ class IslandService : Service() {
         if (userExpanded) handler.postDelayed(autoCollapse, EXPAND_TIMEOUT)
     }
 
-    private fun applyRim(k: Kind) {
-        val (key, colors) = when {
-            k == Kind.MEDIA && mediaArt != null -> "m$accent" to palette(accent)
-            k == Kind.CHARGE || k == Kind.CALL_RING || k == Kind.CALL_ACTIVE ->
-                "g" to intArrayOf(GREEN, 0xFF30D5C8.toInt(), 0xFFB6FF3B.toInt(), GREEN)
-            else -> "d" to intArrayOf(0xFF00E5FF.toInt(), 0xFFB14DFF.toInt(), 0xFFFF4D8D.toInt(), 0xFF00E5FF.toInt())
+    private fun applyTint(k: Kind) {
+        pill.tint = when {
+            k == Kind.MEDIA && mediaArt != null -> accent
+            k == Kind.CHARGE || k == Kind.CALL_RING || k == Kind.CALL_ACTIVE -> GREEN
+            else -> 0
         }
-        if (key != rimKey) {
-            rimKey = key
-            pill.rimColors = colors
-        }
-    }
-
-    private fun palette(c: Int): IntArray {
-        val hsv = FloatArray(3)
-        Color.colorToHSV(c, hsv)
-        fun shift(deg: Float): Int = Color.HSVToColor(floatArrayOf((hsv[0] + deg + 360f) % 360f, hsv[1], hsv[2]))
-        return intArrayOf(c, shift(45f), shift(-45f), c)
     }
 
     private fun sizeFor(k: Kind, exp: Boolean): Pair<Int, Int> {
