@@ -16,10 +16,14 @@ import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
+import android.graphics.Matrix
 import android.graphics.Outline
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.graphics.RectF
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
@@ -31,6 +35,7 @@ import android.os.BatteryManager
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -38,6 +43,7 @@ import android.telecom.TelecomManager
 import android.telephony.TelephonyCallback
 import android.telephony.TelephonyManager
 import android.text.TextUtils
+import android.util.TypedValue
 import android.view.Display
 import android.view.GestureDetector
 import android.view.Gravity
@@ -51,7 +57,7 @@ import android.widget.Chronometer
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.ProgressBar
+import android.widget.SeekBar
 import android.widget.TextView
 import kotlin.math.abs
 import kotlin.math.cos
@@ -92,16 +98,84 @@ class WaveView(ctx: Context) : View(ctx) {
     }
 }
 
+/** The island body: glossy 3D black glass with a flowing colour rim. */
+class PillView(ctx: Context) : FrameLayout(ctx) {
+    var radius = 0f
+    var rimSpan = 1000f
+    var rimColors: IntArray = intArrayOf(0xFF00E5FF.toInt(), 0xFFB14DFF.toInt(), 0xFFFF4D8D.toInt(), 0xFF00E5FF.toInt())
+        set(v) { field = v; rimShader = null; invalidate() }
+    var phase = 0f
+        set(v) { field = v; invalidate() }
+
+    private val body = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val rim = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+    private val gloss = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; color = 0x66FFFFFF }
+    private val streak = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x30FFFFFF }
+    private var rimShader: LinearGradient? = null
+    private var bodyShader: LinearGradient? = null
+    private var bodyH = -1f
+    private val m = Matrix()
+    private val r = RectF()
+
+    init { setWillNotDraw(false) }
+
+    override fun onDraw(c: Canvas) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        if (w <= 0f || h <= 0f) return
+        val d = resources.displayMetrics.density
+
+        // body: lighter top fading to deep black = a little depth
+        val ge = min(h, 60f * d)
+        if (bodyShader == null || bodyH != ge) {
+            bodyShader = LinearGradient(0f, 0f, 0f, ge, 0xFF30303A.toInt(), Color.BLACK, Shader.TileMode.CLAMP)
+            bodyH = ge
+        }
+        body.shader = bodyShader
+        r.set(0f, 0f, w, h)
+        c.drawRoundRect(r, radius, radius, body)
+
+        // flowing colour rim
+        val sw = 1.6f * d
+        val rs = rimShader ?: LinearGradient(0f, 0f, rimSpan, 0f, rimColors, null, Shader.TileMode.REPEAT).also { rimShader = it }
+        m.setTranslate(phase * rimSpan, 0f)
+        rs.setLocalMatrix(m)
+        rim.shader = rs
+        rim.strokeWidth = sw
+        r.set(sw / 2, sw / 2, w - sw / 2, h - sw / 2)
+        c.drawRoundRect(r, radius - sw / 2, radius - sw / 2, rim)
+
+        // glossy top edge
+        c.save()
+        c.clipRect(0f, 0f, w, h * 0.45f)
+        gloss.strokeWidth = d
+        r.set(sw + d * 0.5f, sw + d * 0.5f, w - sw - d * 0.5f, h - sw - d * 0.5f)
+        c.drawRoundRect(r, radius - sw, radius - sw, gloss)
+        c.restore()
+
+        // soft specular streak (only on the small pill)
+        if (h < 80f * d) {
+            val sh = 2f * d
+            r.set(h * 0.5f, sw + 2f * d, w - h * 0.5f, sw + 2f * d + sh)
+            c.drawRoundRect(r, sh / 2, sh / 2, streak)
+        }
+    }
+}
+
 class IslandService : Service() {
 
     companion object {
         var instance: IslandService? = null
         var callerName: String? = null
+
+        // ---- EASY TWEAKS ----
+        const val SIDE_MM = 10f         // millimetres the pill extends each side of the camera (10 = 1 cm)
+        const val GROW = 26             // dp: extra width when something is showing
         const val PAD = 1               // dp: pill is this much bigger than the camera hole
-        const val SIDE = 46             // dp: how far the compact pill grows each side
-        const val NOTIF_MS = 4500L      // notification stays open this long
+        const val NOTIF_MS = 4500L
         const val CHARGE_MS = 3500L
         const val EXPAND_TIMEOUT = 12000L
+
         const val GREEN = 0xFF34C759.toInt()
         const val RED = 0xFFFF3B30.toInt()
         const val GREY = 0xFF9A9A9E.toInt()
@@ -114,7 +188,7 @@ class IslandService : Service() {
     private class NotifData(val id: Int, val pkg: String, val label: String, val title: String, val text: String, val pi: PendingIntent?)
 
     private lateinit var wm: WindowManager
-    private lateinit var pill: FrameLayout
+    private lateinit var pill: PillView
     private lateinit var lp: WindowManager.LayoutParams
     private lateinit var gestures: GestureDetector
     private val handler = Handler(Looper.getMainLooper())
@@ -128,6 +202,9 @@ class IslandService : Service() {
     private var content: View? = null
     private var contentKey = ""
     private var visibleOk = true
+    private var screenOn = true
+    private var rimPhase = 0f
+    private var rimKey = ""
 
     private var kind = Kind.NONE
     private var expanded = false
@@ -135,6 +212,8 @@ class IslandService : Service() {
 
     private var notif: NotifData? = null
     private var notifCounter = 0
+    private var unread: List<String> = emptyList()
+    private var trayHidden = false
     private var charging = false
     private var callState = 0
     private var callStart = 0L
@@ -150,12 +229,15 @@ class IslandService : Service() {
     private var accent = Color.WHITE
     private var mediaDismissed = false
     private var lastPlaying = false
+    private var seeking = false
 
     private var waveRef: WaveView? = null
     private var playRef: ImageView? = null
-    private var progressRef: ProgressBar? = null
+    private var progressRef: SeekBar? = null
     private var elapsedRef: TextView? = null
     private var totalRef: TextView? = null
+    private var artRef: ImageView? = null
+    private var artAnim: ValueAnimator? = null
 
     private var bubble: ImageView? = null
     private var blp: WindowManager.LayoutParams? = null
@@ -172,9 +254,22 @@ class IslandService : Service() {
             }
         }
     }
+    private val rimTick = object : Runnable {
+        override fun run() {
+            rimPhase = (rimPhase + 0.004f) % 1f
+            pill.phase = rimPhase
+            if (screenOn && visibleOk) handler.postDelayed(this, 33)
+        }
+    }
 
     private val chargeReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, i: Intent?) { onPowerConnected() }
+    }
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, i: Intent?) {
+            screenOn = i?.action == Intent.ACTION_SCREEN_ON
+            startRim()
+        }
     }
 
     private val mediaCb = object : MediaController.Callback() {
@@ -189,6 +284,8 @@ class IslandService : Service() {
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun mm(v: Float) = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_MM, v, resources.displayMetrics).toInt()
+    private fun idleW() = cutW + mm(SIDE_MM) * 2
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -208,26 +305,33 @@ class IslandService : Service() {
         )
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         vib = getSystemService(Vibrator::class.java)
+        screenOn = getSystemService(PowerManager::class.java)?.isInteractive ?: true
         gestures = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean = true
-            override fun onSingleTapUp(e: MotionEvent): Boolean { openApp(); return true }
+            override fun onSingleTapUp(e: MotionEvent): Boolean { onTap(); return true }
             override fun onLongPress(e: MotionEvent) {
                 if (!expanded && (kind == Kind.MEDIA || kind == Kind.CALL_ACTIVE)) {
                     haptic(); userExpanded = true; render()
                 }
             }
             override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
-                if (vy < -dp(300) && abs(vy) > abs(vx)) { swipeUp(); return true }
-                if (abs(vx) > dp(400) && abs(vx) > abs(vy)) { dismissCurrent(); return true }
+                val horiz = abs(vx) > abs(vy)
+                if (!horiz && vy < -dp(300)) { swipeUp(); return true }
+                if (horiz && abs(vx) > dp(400)) { swipeSide(vx); return true }
                 return false
             }
         })
         readCutout()
         buildPill()
         registerReceiver(chargeReceiver, IntentFilter(Intent.ACTION_POWER_CONNECTED))
+        registerReceiver(screenReceiver, IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+        })
         refreshMedia()
         registerCall()
         render(false)
+        startRim()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -247,13 +351,16 @@ class IslandService : Service() {
             contentKey = ""
             render(false)
         }
+        startRim()
         updateBubble()
     }
 
     override fun onDestroy() {
         instance = null
         handler.removeCallbacksAndMessages(null)
+        artAnim?.cancel()
         try { unregisterReceiver(chargeReceiver) } catch (_: Exception) {}
+        try { unregisterReceiver(screenReceiver) } catch (_: Exception) {}
         try { controller?.unregisterCallback(mediaCb) } catch (_: Exception) {}
         try {
             sessionsListener?.let { getSystemService(MediaSessionManager::class.java).removeOnActiveSessionsChangedListener(it) }
@@ -262,6 +369,11 @@ class IslandService : Service() {
         try { wm.removeView(pill) } catch (_: Exception) {}
         removeBubble()
         super.onDestroy()
+    }
+
+    private fun startRim() {
+        handler.removeCallbacks(rimTick)
+        if (screenOn && visibleOk) handler.post(rimTick)
     }
 
     // ---------------------------------------------------------------- window
@@ -286,8 +398,8 @@ class IslandService : Service() {
             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-        if (touchable) flags = flags or WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
-        else flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        flags = if (touchable) flags or WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
+        else flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
         return WindowManager.LayoutParams(
             w, h, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, flags, PixelFormat.TRANSLUCENT
         ).apply {
@@ -298,10 +410,11 @@ class IslandService : Service() {
     }
 
     private fun buildPill() {
-        lp = overlayParams(cutW, cutH, true)
+        lp = overlayParams(idleW(), cutH, true)
         curRadius = radiusFor(cutH)
-        pill = FrameLayout(this).apply {
-            setBackgroundColor(Color.BLACK)
+        pill = PillView(this).apply {
+            radius = curRadius
+            rimSpan = resources.displayMetrics.widthPixels.toFloat()
             clipToOutline = true
             outlineProvider = object : ViewOutlineProvider() {
                 override fun getOutline(v: View, o: Outline) {
@@ -316,9 +429,10 @@ class IslandService : Service() {
     private fun radiusFor(h: Int) = min(h / 2f, dp(44).toFloat())
 
     private fun setSize(w: Int, h: Int) {
-        lp.width = w.coerceAtLeast(cutW)
+        lp.width = w.coerceAtLeast(idleW())
         lp.height = h.coerceAtLeast(cutH)
         curRadius = radiusFor(lp.height)
+        pill.radius = curRadius
         try { wm.updateViewLayout(pill, lp) } catch (_: Exception) {}
         pill.invalidateOutline()
         positionBubble()
@@ -342,12 +456,14 @@ class IslandService : Service() {
 
     // ---------------------------------------------------------------- touch
 
+    private fun showTray() = unread.isNotEmpty() && !trayHidden
+
     private fun onPillTouch(e: MotionEvent): Boolean {
         if (e.action == MotionEvent.ACTION_OUTSIDE) {
             if (expanded && (kind == Kind.MEDIA || kind == Kind.CALL_ACTIVE)) { userExpanded = false; render() }
             return false
         }
-        if (kind != Kind.NONE) {
+        if (kind != Kind.NONE || showTray()) {
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     pill.animate().scaleX(0.97f).scaleY(0.97f).setDuration(120).start()
@@ -367,10 +483,37 @@ class IslandService : Service() {
         try { vib?.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK)) } catch (_: Exception) {}
     }
 
+    private fun pop(v: View) {
+        haptic()
+        v.animate().scaleX(0.8f).scaleY(0.8f).setDuration(70).withEndAction {
+            v.animate().scaleX(1f).scaleY(1f).setDuration(320).setInterpolator(SpringInterp()).start()
+        }.start()
+    }
+
+    private fun onTap() {
+        when {
+            kind == Kind.MEDIA && !expanded -> { pop(pill); togglePlay() }
+            kind == Kind.NOTIF -> openApp()
+            kind == Kind.NONE && showTray() -> { haptic(); openShade() }
+        }
+    }
+
     private fun swipeUp() {
         when {
             expanded && (kind == Kind.MEDIA || kind == Kind.CALL_ACTIVE) -> { userExpanded = false; render() }
-            kind == Kind.NOTIF -> dismissCurrent()
+            kind == Kind.NOTIF || kind == Kind.CHARGE || kind == Kind.MEDIA -> dismissCurrent()
+        }
+    }
+
+    private fun swipeSide(vx: Float) {
+        when {
+            kind == Kind.MEDIA && !expanded -> {
+                pop(pill)
+                if (vx < 0) controller?.transportControls?.skipToNext()
+                else controller?.transportControls?.skipToPrevious()
+            }
+            kind == Kind.NOTIF || kind == Kind.CHARGE -> dismissCurrent()
+            kind == Kind.NONE && showTray() -> { trayHidden = true; render() }
         }
     }
 
@@ -383,6 +526,13 @@ class IslandService : Service() {
             else -> return
         }
         render()
+    }
+
+    private fun openShade() {
+        try {
+            val sb = getSystemService("statusbar")
+            sb?.javaClass?.getMethod("expandNotificationsPanel")?.invoke(sb)
+        } catch (_: Exception) {}
     }
 
     private fun openApp() {
@@ -432,11 +582,14 @@ class IslandService : Service() {
         kind = k
         expanded = exp
         val (w, h) = sizeFor(k, exp)
-        val key = "$k|$exp|${notif?.id}|$mediaTitle|$mediaArtist|${System.identityHashCode(mediaArt)}|$callerName|$demoCall"
+        val trayKey = if (k == Kind.NONE && showTray()) unread.joinToString(",") else ""
+        val key = "$k|$exp|${notif?.id}|$mediaTitle|$mediaArtist|${System.identityHashCode(mediaArt)}|$callerName|$demoCall|$trayKey"
         if (key != contentKey) {
             contentKey = key
-            swap(if (k == Kind.NONE) null else buildContent(k, exp), w, h, animate)
+            val v: View? = if (k == Kind.NONE && !showTray()) null else buildContent(k, exp)
+            swap(v, w, h, animate)
         }
+        applyRim(k)
         animateTo(w, h, animate)
         updateMediaDynamic()
         updateBubble()
@@ -447,12 +600,32 @@ class IslandService : Service() {
         if (userExpanded) handler.postDelayed(autoCollapse, EXPAND_TIMEOUT)
     }
 
+    private fun applyRim(k: Kind) {
+        val (key, colors) = when {
+            k == Kind.MEDIA && mediaArt != null -> "m$accent" to palette(accent)
+            k == Kind.CHARGE || k == Kind.CALL_RING || k == Kind.CALL_ACTIVE ->
+                "g" to intArrayOf(GREEN, 0xFF30D5C8.toInt(), 0xFFB6FF3B.toInt(), GREEN)
+            else -> "d" to intArrayOf(0xFF00E5FF.toInt(), 0xFFB14DFF.toInt(), 0xFFFF4D8D.toInt(), 0xFF00E5FF.toInt())
+        }
+        if (key != rimKey) {
+            rimKey = key
+            pill.rimColors = colors
+        }
+    }
+
+    private fun palette(c: Int): IntArray {
+        val hsv = FloatArray(3)
+        Color.colorToHSV(c, hsv)
+        fun shift(deg: Float): Int = Color.HSVToColor(floatArrayOf((hsv[0] + deg + 360f) % 360f, hsv[1], hsv[2]))
+        return intArrayOf(c, shift(45f), shift(-45f), c)
+    }
+
     private fun sizeFor(k: Kind, exp: Boolean): Pair<Int, Int> {
         val bigW = min(resources.displayMetrics.widthPixels - dp(24), dp(380))
         return when {
-            k == Kind.NONE -> Pair(cutW, cutH)
-            !exp -> Pair(cutW + dp(SIDE) * 2, cutH)
-            k == Kind.MEDIA -> Pair(bigW, dp(196))
+            k == Kind.NONE -> Pair(idleW(), cutH)
+            !exp -> Pair(idleW() + dp(GROW), cutH)
+            k == Kind.MEDIA -> Pair(bigW, dp(212))
             k == Kind.NOTIF -> Pair(bigW, dp(112))
             k == Kind.CALL_RING -> Pair(bigW, dp(144))
             else -> Pair(bigW, dp(124))
@@ -476,14 +649,14 @@ class IslandService : Service() {
     }
 
     private fun buildContent(k: Kind, exp: Boolean): View {
-        waveRef = null; playRef = null; progressRef = null; elapsedRef = null; totalRef = null
+        waveRef = null; playRef = null; progressRef = null; elapsedRef = null; totalRef = null; artRef = null
         return when (k) {
             Kind.MEDIA -> if (exp) mediaExpanded() else mediaCompact()
             Kind.CALL_RING -> callRing()
             Kind.CALL_ACTIVE -> if (exp) callActiveExpanded() else callActiveCompact()
             Kind.CHARGE -> chargeCompact()
             Kind.NOTIF -> notifExpanded()
-            Kind.NONE -> View(this)
+            Kind.NONE -> trayView()
         }
     }
 
@@ -513,6 +686,12 @@ class IslandService : Service() {
         }
     }
 
+    private fun appIcon(pkg: String?, radius: Int): ImageView {
+        val iv = roundedImage(radius)
+        try { if (pkg != null) iv.setImageDrawable(packageManager.getApplicationIcon(pkg)) } catch (_: Exception) {}
+        return iv
+    }
+
     private fun setArt(iv: ImageView) {
         val a = mediaArt
         if (a != null) iv.setImageBitmap(a) else iv.setBackgroundColor(0xFF444444.toInt())
@@ -525,14 +704,14 @@ class IslandService : Service() {
         setTypeface(typeface, Typeface.BOLD)
         gravity = Gravity.CENTER
         background = GradientDrawable().apply { setColor(color); cornerRadius = dp(40).toFloat() }
-        setOnClickListener { onClick() }
+        setOnClickListener { pop(it); onClick() }
     }
 
     private fun iconBtn(res: Int, onClick: () -> Unit) = ImageView(this).apply {
         setImageResource(res)
         setColorFilter(Color.WHITE)
         setPadding(dp(10), dp(10), dp(10), dp(10))
-        setOnClickListener { onClick() }
+        setOnClickListener { pop(it); onClick() }
     }
 
     private fun chrono(sp: Float) = Chronometer(this).apply {
@@ -547,14 +726,40 @@ class IslandService : Service() {
         setPadding(dp(16), dp(12), dp(16), dp(10))
     }
 
+    // ---------------------------------------------------------------- idle tray (app icons of unread notifications)
+
+    private fun trayView(): View {
+        val f = FrameLayout(this)
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        for (p in unread.take(2)) {
+            row.addView(appIcon(p, dp(5)), LinearLayout.LayoutParams(dp(18), dp(18)).apply { marginEnd = dp(5) })
+        }
+        f.addView(row, lpf(WRAP, WRAP, Gravity.START or Gravity.CENTER_VERTICAL, ms = dp(14)))
+        if (unread.size > 2) {
+            f.addView(tv("+${unread.size - 2}", 11f, Color.WHITE, true),
+                lpf(WRAP, WRAP, Gravity.END or Gravity.CENTER_VERTICAL, me = dp(18)))
+        }
+        return f
+    }
+
+    fun setUnread(pkgs: List<String>) {
+        handler.post {
+            if (pkgs.size > unread.size) trayHidden = false
+            unread = pkgs
+            if (pkgs.isEmpty()) trayHidden = false
+            render()
+        }
+    }
+
     // ---------------------------------------------------------------- media
 
     private fun mediaCompact(): View {
         val f = FrameLayout(this)
         val art = roundedImage(dp(6)); setArt(art)
-        f.addView(art, lpf(dp(22), dp(22), Gravity.START or Gravity.CENTER_VERTICAL, ms = dp(12)))
+        artRef = art
+        f.addView(art, lpf(dp(22), dp(22), Gravity.START or Gravity.CENTER_VERTICAL, ms = dp(14)))
         val wave = WaveView(this).also { it.color = accent; it.active = isPlaying() }
-        f.addView(wave, lpf(dp(20), dp(16), Gravity.END or Gravity.CENTER_VERTICAL, me = dp(14)))
+        f.addView(wave, lpf(dp(20), dp(16), Gravity.END or Gravity.CENTER_VERTICAL, me = dp(16)))
         waveRef = wave
         return f
     }
@@ -563,34 +768,69 @@ class IslandService : Service() {
         val col = column()
         val top = FrameLayout(this)
         val art = roundedImage(dp(10)); setArt(art)
+        art.setOnClickListener { pop(it); openApp() }
+        artRef = art
         top.addView(art, lpf(dp(44), dp(44), Gravity.START))
+        top.addView(appIcon(controller?.packageName, dp(5)),
+            lpf(dp(20), dp(20), Gravity.END or Gravity.CENTER_VERTICAL, me = dp(2)))
         val wave = WaveView(this).also { it.color = accent; it.active = isPlaying() }
-        top.addView(wave, lpf(dp(28), dp(22), Gravity.END or Gravity.CENTER_VERTICAL, me = dp(2)))
+        top.addView(wave, lpf(dp(26), dp(20), Gravity.END or Gravity.CENTER_VERTICAL, me = dp(32)))
         waveRef = wave
         col.addView(top, llp(MATCH, dp(44)))
         col.addView(tv(mediaTitle, 16f, Color.WHITE, true), llp(MATCH, WRAP, dp(8)))
         col.addView(tv(mediaArtist, 14f, GREY), llp(MATCH, WRAP))
-        val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+
+        val bar = SeekBar(this).apply {
             max = 1000
-            progressTintList = ColorStateList.valueOf(Color.WHITE)
+            progressTintList = ColorStateList.valueOf(accent)
             progressBackgroundTintList = ColorStateList.valueOf(0x40FFFFFF)
+            thumb = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.WHITE)
+                setSize(dp(10), dp(10))
+            }
+            thumbOffset = 0
+            setPadding(dp(5), 0, dp(5), 0)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) {
+                    if (fromUser) elapsedRef?.text = fmt(mediaDuration * p / 1000)
+                }
+                override fun onStartTrackingTouch(sb: SeekBar) {
+                    seeking = true
+                    handler.removeCallbacks(autoCollapse)
+                }
+                override fun onStopTrackingTouch(sb: SeekBar) {
+                    seeking = false
+                    controller?.transportControls?.seekTo(mediaDuration * sb.progress / 1000)
+                    if (userExpanded) handler.postDelayed(autoCollapse, EXPAND_TIMEOUT)
+                }
+            })
         }
         progressRef = bar
-        col.addView(bar, llp(MATCH, dp(4), dp(10)))
+        col.addView(bar, llp(MATCH, dp(24), dp(6)))
         val times = FrameLayout(this)
         val e = tv("0:00", 11f, GREY)
         val t = tv("", 11f, GREY)
         elapsedRef = e; totalRef = t
-        times.addView(e, lpf(WRAP, WRAP, Gravity.START))
-        times.addView(t, lpf(WRAP, WRAP, Gravity.END))
-        col.addView(times, llp(MATCH, WRAP, dp(4)))
+        times.addView(e, lpf(WRAP, WRAP, Gravity.START, ms = dp(5)))
+        times.addView(t, lpf(WRAP, WRAP, Gravity.END, me = dp(5)))
+        col.addView(times, llp(MATCH, WRAP))
+
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
         val prev = iconBtn(android.R.drawable.ic_media_previous) { controller?.transportControls?.skipToPrevious() }
-        val play = iconBtn(if (isPlaying()) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play) { togglePlay() }
+        val play = ImageView(this).apply {
+            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.WHITE) }
+            setImageResource(if (isPlaying()) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play)
+            setColorFilter(Color.BLACK)
+            setPadding(dp(11), dp(11), dp(11), dp(11))
+            setOnClickListener { pop(it); togglePlay() }
+        }
         val next = iconBtn(android.R.drawable.ic_media_next) { controller?.transportControls?.skipToNext() }
         playRef = play
-        for (b in listOf(prev, play, next)) row.addView(b, LinearLayout.LayoutParams(dp(60), dp(44)))
-        col.addView(row, llp(MATCH, dp(44), dp(2)))
+        row.addView(prev, LinearLayout.LayoutParams(dp(52), dp(44)))
+        row.addView(play, LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginStart = dp(14); marginEnd = dp(14) })
+        row.addView(next, LinearLayout.LayoutParams(dp(52), dp(44)))
+        col.addView(row, llp(MATCH, dp(44), dp(4)))
         return col
     }
 
@@ -604,10 +844,34 @@ class IslandService : Service() {
         waveRef?.let { it.color = accent; if (it.active != playing) it.active = playing }
         playRef?.setImageResource(if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play)
         updateProgress()
+
+        // album art "breathes" while music plays
+        val a = artRef
+        if (a != null && playing) {
+            if (artAnim == null) {
+                artAnim = ValueAnimator.ofFloat(1f, 1.07f).apply {
+                    duration = 1100
+                    repeatCount = ValueAnimator.INFINITE
+                    repeatMode = ValueAnimator.REVERSE
+                    addUpdateListener {
+                        val s = it.animatedValue as Float
+                        artRef?.scaleX = s
+                        artRef?.scaleY = s
+                    }
+                    start()
+                }
+            }
+        } else {
+            artAnim?.cancel()
+            artAnim = null
+            a?.scaleX = 1f
+            a?.scaleY = 1f
+        }
     }
 
     private fun updateProgress() {
         val bar = progressRef ?: return
+        if (seeking) return
         val st = controller?.playbackState ?: return
         val pos = if (st.state == PlaybackState.STATE_PLAYING)
             st.position + ((SystemClock.elapsedRealtime() - st.lastPositionUpdateTime) * st.playbackSpeed).toLong()
@@ -749,8 +1013,8 @@ class IslandService : Service() {
             setImageResource(android.R.drawable.sym_action_call)
             setColorFilter(GREEN)
         }
-        f.addView(icon, lpf(dp(20), dp(20), Gravity.START or Gravity.CENTER_VERTICAL, ms = dp(12)))
-        f.addView(chrono(12f), lpf(WRAP, WRAP, Gravity.END or Gravity.CENTER_VERTICAL, me = dp(10)))
+        f.addView(icon, lpf(dp(20), dp(20), Gravity.START or Gravity.CENTER_VERTICAL, ms = dp(14)))
+        f.addView(chrono(12f), lpf(WRAP, WRAP, Gravity.END or Gravity.CENTER_VERTICAL, me = dp(14)))
         return f
     }
 
@@ -787,8 +1051,8 @@ class IslandService : Service() {
 
     private fun chargeCompact(): View {
         val f = FrameLayout(this)
-        f.addView(tv("\u26A1", 15f, GREEN), lpf(WRAP, WRAP, Gravity.START or Gravity.CENTER_VERTICAL, ms = dp(14)))
-        f.addView(tv("${batteryPercent()}%", 13f, GREEN, true), lpf(WRAP, WRAP, Gravity.END or Gravity.CENTER_VERTICAL, me = dp(12)))
+        f.addView(tv("\u26A1", 15f, GREEN), lpf(WRAP, WRAP, Gravity.START or Gravity.CENTER_VERTICAL, ms = dp(16)))
+        f.addView(tv("${batteryPercent()}%", 13f, GREEN, true), lpf(WRAP, WRAP, Gravity.END or Gravity.CENTER_VERTICAL, me = dp(14)))
         return f
     }
 
@@ -801,6 +1065,7 @@ class IslandService : Service() {
             val pm = packageManager
             val label = try { pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString() } catch (_: Exception) { "" }
             notifCounter++
+            trayHidden = false
             notif = NotifData(notifCounter, pkg, label, title, text, pi)
             handler.removeCallbacks(notifOff)
             handler.postDelayed(notifOff, NOTIF_MS)
@@ -812,9 +1077,7 @@ class IslandService : Service() {
         val n = notif
         val col = column()
         val top = FrameLayout(this)
-        val icon = roundedImage(dp(6))
-        try { if (n != null) icon.setImageDrawable(packageManager.getApplicationIcon(n.pkg)) } catch (_: Exception) {}
-        top.addView(icon, lpf(dp(24), dp(24), Gravity.START or Gravity.CENTER_VERTICAL))
+        top.addView(appIcon(n?.pkg, dp(7)), lpf(dp(26), dp(26), Gravity.START or Gravity.CENTER_VERTICAL))
         top.addView(tv(n?.label, 12f, GREY), lpf(WRAP, WRAP, Gravity.END or Gravity.CENTER_VERTICAL))
         col.addView(top, llp(MATCH, cutH))
         col.addView(tv(n?.title, 16f, Color.WHITE, true), llp(MATCH, WRAP, dp(6)))
