@@ -3,6 +3,7 @@ package com.nigel.island
 import android.animation.ValueAnimator
 import android.app.Activity
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
@@ -20,6 +21,7 @@ import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 
@@ -40,6 +42,7 @@ class MainActivity : Activity() {
     }
 
     private val refreshers = ArrayList<() -> Unit>()
+    private val prefs by lazy { getSharedPreferences("atoll", MODE_PRIVATE) }
     private var autoStarted = false
     private lateinit var statusLine: TextView
     private lateinit var cta: TextView
@@ -92,7 +95,8 @@ class MainActivity : Activity() {
 
     private fun phoneOk() =
         checkSelfPermission("android.permission.READ_PHONE_STATE") == PackageManager.PERMISSION_GRANTED &&
-            checkSelfPermission("android.permission.ANSWER_PHONE_CALLS") == PackageManager.PERMISSION_GRANTED
+            checkSelfPermission("android.permission.ANSWER_PHONE_CALLS") == PackageManager.PERMISSION_GRANTED &&
+            checkSelfPermission("android.permission.READ_CONTACTS") == PackageManager.PERMISSION_GRANTED
 
     private fun batteryOk() = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
 
@@ -146,6 +150,57 @@ class MainActivity : Activity() {
         setPadding(dp(8), dp(14), dp(8), dp(14))
         background = glass(14)
         setOnClickListener { bounce(it); onClick() }
+    }
+
+    private fun stepBtn(text: String, onClick: () -> Unit) = TextView(this).apply {
+        this.text = text
+        textSize = 20f
+        setTextColor(Color.WHITE)
+        gravity = Gravity.CENTER
+        background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(0x24FFFFFF) }
+        setOnClickListener { onClick() }
+    }
+
+    /** A slider with - and + buttons that saves to settings and moves the island live. */
+    private fun adjuster(title: String, key: String, lo: Int, hi: Int, def: Int, unit: String): View {
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        head.addView(label(title, 14f, Color.WHITE, true), LinearLayout.LayoutParams(0, WRAP, 1f))
+        val valueView = label("", 13f, AQUA, true)
+        head.addView(valueView)
+        box.addView(head)
+        val seek = SeekBar(this).apply {
+            max = hi - lo
+            progressTintList = ColorStateList.valueOf(AQUA)
+            thumbTintList = ColorStateList.valueOf(Color.WHITE)
+            progressBackgroundTintList = ColorStateList.valueOf(0x40FFFFFF)
+        }
+        fun cur() = prefs.getInt(key, def)
+        fun put(v: Int) {
+            val c = v.coerceIn(lo, hi)
+            prefs.edit().putInt(key, c).apply()
+            valueView.text = "$c$unit"
+            if (seek.progress != c - lo) seek.progress = c - lo
+            IslandService.instance?.applyPrefs()
+        }
+        seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) { if (fromUser) put(p + lo) }
+            override fun onStartTrackingTouch(sb: SeekBar) {}
+            override fun onStopTrackingTouch(sb: SeekBar) {}
+        })
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        row.addView(stepBtn("\u2212") { put(cur() - 1) }, LinearLayout.LayoutParams(dp(40), dp(40)))
+        row.addView(seek, LinearLayout.LayoutParams(0, WRAP, 1f))
+        row.addView(stepBtn("+") { put(cur() + 1) }, LinearLayout.LayoutParams(dp(40), dp(40)))
+        box.addView(row, lp(MATCH, WRAP, 4))
+        val refresh: () -> Unit = {
+            val c = cur()
+            valueView.text = "$c$unit"
+            seek.progress = c - lo
+        }
+        refreshers.add(refresh)
+        refresh()
+        return box
     }
 
     private fun needIsland(block: (IslandService) -> Unit) {
@@ -240,8 +295,15 @@ class MainActivity : Activity() {
         col.addView(stepCard("\uD83D\uDD14", "Notification access", "Greyed out? App info \u2192 \u22EE \u2192 Allow restricted settings", this::listenerOk) {
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         }, lp(MATCH, WRAP, 10))
-        col.addView(stepCard("\uD83D\uDCDE", "Calls", "Lets you answer and end calls from the island", this::phoneOk) {
-            requestPermissions(arrayOf("android.permission.READ_PHONE_STATE", "android.permission.ANSWER_PHONE_CALLS"), 2)
+        col.addView(stepCard("\uD83D\uDCDE", "Calls & contacts", "Answer calls and see the caller's name and photo", this::phoneOk) {
+            requestPermissions(
+                arrayOf(
+                    "android.permission.READ_PHONE_STATE",
+                    "android.permission.ANSWER_PHONE_CALLS",
+                    "android.permission.READ_CONTACTS",
+                    "android.permission.READ_CALL_LOG"
+                ), 2
+            )
         }, lp(MATCH, WRAP, 10))
         col.addView(stepCard("\uD83D\uDD0B", "Keep it alive", "Set battery to unrestricted so Samsung doesn't kill it", this::batteryOk) {
             startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
@@ -267,6 +329,25 @@ class MainActivity : Activity() {
         tryRow.addView(tryChip("\u26A1  Charge") { needIsland { it.demoCharge() } },
             LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginStart = dp(6) })
         col.addView(tryRow, lp(MATCH, WRAP, 10))
+
+        // fine-tune
+        col.addView(label("FINE-TUNE", 12f, AQUA, true).apply { letterSpacing = 0.12f }, lp(WRAP, WRAP, 30))
+        val tune = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            background = glass(16)
+        }
+        tune.addView(label("Slide until the island sits perfectly on your camera. It moves live.", 13f, MUTED))
+        tune.addView(adjuster("Left / Right", "x", -120, 120, 0, " px"), lp(MATCH, WRAP, 14))
+        tune.addView(adjuster("Up / Down", "y", -120, 120, 0, " px"), lp(MATCH, WRAP, 10))
+        tune.addView(adjuster("Pill width", "w", -150, 250, 0, " px"), lp(MATCH, WRAP, 10))
+        tune.addView(adjuster("Frostiness", "frost", 0, 100, 80, " %"), lp(MATCH, WRAP, 10))
+        tune.addView(tryChip("Reset all") {
+            prefs.edit().putInt("x", 0).putInt("y", 0).putInt("w", 0).putInt("frost", 80).apply()
+            IslandService.instance?.applyPrefs()
+            refreshAll()
+        }, lp(MATCH, WRAP, 14))
+        col.addView(tune, lp(MATCH, WRAP, 10))
 
         // gestures
         col.addView(label("GESTURES", 12f, AQUA, true).apply { letterSpacing = 0.12f }, lp(WRAP, WRAP, 30))
