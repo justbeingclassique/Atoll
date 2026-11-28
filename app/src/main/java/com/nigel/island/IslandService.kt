@@ -14,6 +14,8 @@ import android.content.IntentFilter
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.BitmapShader
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
@@ -28,6 +30,7 @@ import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
+import android.net.Uri
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
@@ -40,7 +43,9 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
+import android.provider.ContactsContract
 import android.telecom.TelecomManager
+import android.telephony.PhoneNumberUtils
 import android.telephony.TelephonyCallback
 import android.telephony.TelephonyManager
 import android.text.TextUtils
@@ -60,6 +65,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.exp
@@ -100,7 +106,7 @@ class WaveView(ctx: Context) : View(ctx) {
     }
 }
 
-/** The island body: glossy solid black when small, liquid glass when expanded. */
+/** The island body: glossy solid black when small, frosted liquid glass when expanded. */
 class PillView(ctx: Context) : FrameLayout(ctx) {
     var radius = 0f
     var glass = 0f
@@ -109,14 +115,24 @@ class PillView(ctx: Context) : FrameLayout(ctx) {
         set(v) { field = v; invalidate() }
     var blurOn = false
         set(v) { field = v; invalidate() }
+    var frost = 0.8f
+        set(v) { field = v; invalidate() }
 
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
     private val layer = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val grain = Paint(Paint.ANTI_ALIAS_FLAG)
     private val edge = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val streak = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x30FFFFFF }
     private val r = RectF()
 
-    init { setWillNotDraw(false) }
+    init {
+        setWillNotDraw(false)
+        // fine frosted-glass grain
+        val rnd = java.util.Random(7)
+        val px = IntArray(96 * 96) { val v = rnd.nextInt(256); Color.argb(255, v, v, v) }
+        val bmp = Bitmap.createBitmap(px, 96, 96, Bitmap.Config.ARGB_8888)
+        grain.shader = BitmapShader(bmp, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
+    }
 
     override fun onDraw(c: Canvas) {
         val w = width.toFloat()
@@ -124,10 +140,14 @@ class PillView(ctx: Context) : FrameLayout(ctx) {
         if (w <= 0f || h <= 0f) return
         val d = resources.displayMetrics.density
         val g = glass.coerceIn(0f, 1f)
+        val f = frost.coerceIn(0f, 1f)
 
         // base: solid black when small, see-through dark glass when big
-        val glassAlpha = if (blurOn) 150 else 225
-        fill.color = Color.argb((255 + (glassAlpha - 255) * g).toInt(), 8, 10, 16)
+        val glassAlpha = if (blurOn) (190 - 70 * f).toInt() else 235
+        fill.color = Color.argb(
+            (255 + (glassAlpha - 255) * g).toInt(),
+            (8 + 14 * g).toInt(), (10 + 16 * g).toInt(), (16 + 22 * g).toInt()
+        )
         r.set(0f, 0f, w, h)
         c.drawRoundRect(r, radius, radius, fill)
 
@@ -139,10 +159,17 @@ class PillView(ctx: Context) : FrameLayout(ctx) {
         }
 
         if (g > 0.02f) {
+            // frosty white veil + fine grain
+            layer.shader = null
+            layer.color = Color.argb(((14 + 41 * f) * (if (blurOn) 1f else 0.5f) * g).toInt(), 255, 255, 255)
+            c.drawRoundRect(r, radius, radius, layer)
+            grain.alpha = (30 * f * g).toInt()
+            c.drawRoundRect(r, radius, radius, grain)
+
             // diagonal sheen across the glass
             layer.shader = LinearGradient(
                 0f, 0f, w, h,
-                intArrayOf(0x44FFFFFF, 0x08FFFFFF, 0x1AFFFFFF), floatArrayOf(0f, 0.55f, 1f), Shader.TileMode.CLAMP
+                intArrayOf(0x55FFFFFF, 0x0AFFFFFF, 0x22FFFFFF), floatArrayOf(0f, 0.55f, 1f), Shader.TileMode.CLAMP
             )
             layer.alpha = (255 * g).toInt()
             c.drawRoundRect(r, radius, radius, layer)
@@ -161,7 +188,7 @@ class PillView(ctx: Context) : FrameLayout(ctx) {
             }
 
             // specular glow in the top-left corner
-            layer.shader = RadialGradient(w * 0.15f, 0f, max(w, h) * 0.55f, 0x40FFFFFF, 0x00FFFFFF, Shader.TileMode.CLAMP)
+            layer.shader = RadialGradient(w * 0.15f, 0f, max(w, h) * 0.55f, 0x50FFFFFF, 0x00FFFFFF, Shader.TileMode.CLAMP)
             layer.alpha = (255 * g).toInt()
             c.drawRoundRect(r, radius, radius, layer)
         }
@@ -181,7 +208,7 @@ class PillView(ctx: Context) : FrameLayout(ctx) {
         if (g > 0.02f) {
             edge.shader = null
             edge.strokeWidth = d
-            edge.color = Color.argb((26 * g).toInt(), 255, 255, 255)
+            edge.color = Color.argb((30 * g).toInt(), 255, 255, 255)
             r.set(sw + d, sw + d, w - sw - d, h - sw - d)
             c.drawRoundRect(r, max(radius - sw - d, 0f), max(radius - sw - d, 0f), edge)
         }
@@ -238,6 +265,14 @@ class IslandService : Service() {
     private var visibleOk = true
     private var blurApplied = false
     private var blurSupported = false
+    private var offX = 0
+    private var offY = 0
+    private var offW = 0
+    private var frost = 0.8f
+    private var contactName: String? = null
+    private var callerNumber: String? = null
+    private var callerPhoto: Bitmap? = null
+    private var phoneReceiverOn = false
 
     private var kind = Kind.NONE
     private var expanded = false
@@ -288,6 +323,16 @@ class IslandService : Service() {
         }
     }
 
+    private val phoneReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, i: Intent?) {
+            val n = i?.getStringExtra(TelephonyManager.EXTRA_INCOMING_NUMBER)
+            if (!n.isNullOrEmpty() && n != callerNumber) {
+                callerNumber = n
+                lookupContact(n)
+            }
+        }
+    }
+
     private val chargeReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, i: Intent?) { onPowerConnected() }
     }
@@ -305,7 +350,14 @@ class IslandService : Service() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun mm(v: Float) = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_MM, v, resources.displayMetrics).toInt()
-    private fun idleW() = cutW + mm(SIDE_MM) * 2
+    private fun idleW() = max(cutW + dp(10), cutW + mm(SIDE_MM) * 2 + offW)
+    private fun baseY() = (cutTop + offY).coerceAtLeast(0)
+    private fun statusBarH(): Int {
+        val id = resources.getIdentifier("status_bar_height", "dimen", "android")
+        return if (id > 0) resources.getDimensionPixelSize(id) else dp(28)
+    }
+    // expanded card hangs just under the normal status bar (and clear of the camera)
+    private fun expandedTop() = max(statusBarH(), cutTop + cutH) + dp(6) + offY
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -340,6 +392,7 @@ class IslandService : Service() {
                 return false
             }
         })
+        loadPrefs()
         readCutout()
         buildPill()
         registerReceiver(chargeReceiver, IntentFilter(Intent.ACTION_POWER_CONNECTED))
@@ -361,7 +414,7 @@ class IslandService : Service() {
         pill.visibility = if (portrait) View.VISIBLE else View.GONE
         if (portrait) {
             readCutout()
-            lp.y = cutTop
+            lp.y = baseY()
             contentKey = ""
             render(false)
         }
@@ -373,6 +426,7 @@ class IslandService : Service() {
         handler.removeCallbacksAndMessages(null)
         artAnim?.cancel()
         try { unregisterReceiver(chargeReceiver) } catch (_: Exception) {}
+        try { unregisterReceiver(phoneReceiver) } catch (_: Exception) {}
         try { controller?.unregisterCallback(mediaCb) } catch (_: Exception) {}
         try {
             sessionsListener?.let { getSystemService(MediaSessionManager::class.java).removeOnActiveSessionsChangedListener(it) }
@@ -382,6 +436,30 @@ class IslandService : Service() {
         removeBubble()
         super.onDestroy()
     }
+
+    // ---------------------------------------------------------------- user adjustments
+
+    private fun loadPrefs() {
+        val p = getSharedPreferences("atoll", MODE_PRIVATE)
+        offX = p.getInt("x", 0)
+        offY = p.getInt("y", 0)
+        offW = p.getInt("w", 0)
+        frost = p.getInt("frost", 80) / 100f
+    }
+
+    /** Called by the app whenever a slider moves. */
+    fun applyPrefs() {
+        handler.post {
+            loadPrefs()
+            lp.x = offX
+            pill.frost = frost
+            if (blurApplied) lp.blurBehindRadius = blurRadius()
+            contentKey = ""
+            render(false)
+        }
+    }
+
+    private fun blurRadius() = dp(10) + (frost * dp(40)).toInt()
 
     // ---------------------------------------------------------------- window
 
@@ -428,7 +506,8 @@ class IslandService : Service() {
             w, h, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, flags, PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            y = cutTop
+            x = offX
+            y = baseY()
             layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         }
     }
@@ -446,14 +525,16 @@ class IslandService : Service() {
             }
             setOnTouchListener { _, e -> onPillTouch(e) }
         }
+        pill.frost = frost
         wm.addView(pill, lp)
     }
 
     private fun radiusFor(h: Int) = min(h / 2f, dp(14).toFloat())
 
-    private fun setSize(w: Int, h: Int) {
+    private fun setSize(w: Int, h: Int, y: Int) {
         lp.width = w.coerceAtLeast(idleW())
         lp.height = h.coerceAtLeast(cutH)
+        lp.y = y.coerceAtLeast(0)
         curRadius = radiusFor(lp.height)
         pill.radius = curRadius
         pill.glass = ((lp.height - cutH).toFloat() / dp(70)).coerceIn(0f, 1f)
@@ -462,7 +543,7 @@ class IslandService : Service() {
             blurApplied = wantBlur
             if (wantBlur) {
                 lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
-                lp.blurBehindRadius = dp(26)
+                lp.blurBehindRadius = blurRadius()
             } else {
                 lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
                 lp.blurBehindRadius = 0
@@ -474,17 +555,18 @@ class IslandService : Service() {
         positionBubble()
     }
 
-    private fun animateTo(w: Int, h: Int, animate: Boolean) {
+    private fun animateTo(w: Int, h: Int, y: Int, animate: Boolean) {
         anim?.cancel()
         val sw = lp.width
         val sh = lp.height
-        if (!animate || (sw == w && sh == h)) { setSize(w, h); return }
+        val sy = lp.y
+        if (!animate || (sw == w && sh == h && sy == y)) { setSize(w, h, y); return }
         anim = ValueAnimator.ofFloat(0f, 1f).apply {
             duration = 520
             interpolator = SpringInterp()
             addUpdateListener {
                 val f = it.animatedValue as Float
-                setSize((sw + (w - sw) * f).toInt(), (sh + (h - sh) * f).toInt())
+                setSize((sw + (w - sw) * f).toInt(), (sh + (h - sh) * f).toInt(), (sy + (y - sy) * f).toInt())
             }
             start()
         }
@@ -620,14 +702,14 @@ class IslandService : Service() {
         expanded = exp
         val (w, h) = sizeFor(k, exp)
         val trayKey = if (k == Kind.NONE && showTray()) unread.joinToString(",") else ""
-        val key = "$k|$exp|${notif?.id}|$mediaTitle|$mediaArtist|${System.identityHashCode(mediaArt)}|$callerName|$demoCall|$trayKey"
+        val key = "$k|$exp|${notif?.id}|$mediaTitle|$mediaArtist|${System.identityHashCode(mediaArt)}|$callerName|$demoCall|$contactName|$callerNumber|${System.identityHashCode(callerPhoto)}|$trayKey"
         if (key != contentKey) {
             contentKey = key
             val v: View? = if (k == Kind.NONE && !showTray()) null else buildContent(k, exp)
             swap(v, w, h, animate)
         }
         applyTint(k)
-        animateTo(w, h, animate)
+        animateTo(w, h, if (exp) expandedTop() else baseY(), animate)
         updateMediaDynamic()
         updateBubble()
 
@@ -650,10 +732,10 @@ class IslandService : Service() {
         return when {
             k == Kind.NONE -> Pair(idleW(), cutH)
             !exp -> Pair(idleW() + dp(GROW), cutH)
-            k == Kind.MEDIA -> Pair(bigW, dp(212))
-            k == Kind.NOTIF -> Pair(bigW, dp(112))
-            k == Kind.CALL_RING -> Pair(bigW, dp(144))
-            else -> Pair(bigW, dp(124))
+            k == Kind.MEDIA -> Pair(bigW, dp(176))
+            k == Kind.NOTIF -> Pair(bigW, dp(92))
+            k == Kind.CALL_RING -> Pair(bigW, dp(138))
+            else -> Pair(bigW, dp(138))
         }
     }
 
@@ -791,19 +873,20 @@ class IslandService : Service() {
 
     private fun mediaExpanded(): View {
         val col = column()
-        val top = FrameLayout(this)
+        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         val art = roundedImage(dp(10)); setArt(art)
         art.setOnClickListener { pop(it); openApp() }
         artRef = art
-        top.addView(art, lpf(dp(44), dp(44), Gravity.START))
-        top.addView(appIcon(controller?.packageName, dp(5)),
-            lpf(dp(20), dp(20), Gravity.END or Gravity.CENTER_VERTICAL, me = dp(2)))
+        head.addView(art, LinearLayout.LayoutParams(dp(52), dp(52)))
+        val info = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        info.addView(tv(mediaTitle, 16f, Color.WHITE, true))
+        info.addView(tv(mediaArtist, 14f, GREY))
+        head.addView(info, LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginStart = dp(12); marginEnd = dp(8) })
         val wave = WaveView(this).also { it.color = accent; it.active = isPlaying() }
-        top.addView(wave, lpf(dp(26), dp(20), Gravity.END or Gravity.CENTER_VERTICAL, me = dp(32)))
         waveRef = wave
-        col.addView(top, llp(MATCH, dp(44)))
-        col.addView(tv(mediaTitle, 16f, Color.WHITE, true), llp(MATCH, WRAP, dp(8)))
-        col.addView(tv(mediaArtist, 14f, GREY), llp(MATCH, WRAP))
+        head.addView(wave, LinearLayout.LayoutParams(dp(26), dp(20)))
+        head.addView(appIcon(controller?.packageName, dp(5)), LinearLayout.LayoutParams(dp(20), dp(20)).apply { marginStart = dp(10) })
+        col.addView(head, llp(MATCH, dp(52)))
 
         val bar = SeekBar(this).apply {
             max = 1000
@@ -976,6 +1059,12 @@ class IslandService : Service() {
                 tm.registerTelephonyCallback(mainExecutor, cb)
                 telCb = cb
             } catch (_: Exception) {}
+            if (!phoneReceiverOn) {
+                try {
+                    registerReceiver(phoneReceiver, IntentFilter(TelephonyManager.ACTION_PHONE_STATE_CHANGED))
+                    phoneReceiverOn = true
+                } catch (_: Exception) {}
+            }
         }
     }
 
@@ -987,12 +1076,74 @@ class IslandService : Service() {
                 if (callState != 2) callStart = SystemClock.elapsedRealtime()
                 callState = 2
             }
-            else -> { callState = 0; callerName = null }
+            else -> {
+                callState = 0
+                callerName = null
+                contactName = null
+                callerNumber = null
+                callerPhoto = null
+            }
         }
         render()
     }
 
-    private fun name() = if (demoCall) "Test Caller" else (callerName ?: "Unknown caller")
+    private fun displayName(): String =
+        contactName ?: callerName ?: prettyNumber(callerNumber) ?: "Unknown caller"
+
+    private fun prettyNumber(n: String?): String? {
+        if (n.isNullOrEmpty()) return null
+        return try { PhoneNumberUtils.formatNumber(n, Locale.getDefault().country) ?: n } catch (_: Exception) { n }
+    }
+
+    /** Look the number up in the phone's contacts (name + photo). */
+    private fun lookupContact(number: String) {
+        Thread {
+            var name: String? = null
+            var photo: Bitmap? = null
+            try {
+                val uri = Uri.withAppendedPath(ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(number))
+                val cols = arrayOf(ContactsContract.PhoneLookup.DISPLAY_NAME, ContactsContract.PhoneLookup.PHOTO_URI)
+                contentResolver.query(uri, cols, null, null, null)?.use { c ->
+                    if (c.moveToFirst()) {
+                        name = c.getString(0)
+                        val pu = c.getString(1)
+                        if (pu != null) {
+                            contentResolver.openInputStream(Uri.parse(pu))?.use { st -> photo = BitmapFactory.decodeStream(st) }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+            val n = name
+            val ph = photo
+            handler.post { contactName = n; callerPhoto = ph; render() }
+        }.start()
+    }
+
+    private fun avatar(): View {
+        val photo = callerPhoto
+        if (photo != null) {
+            return ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                clipToOutline = true
+                outlineProvider = object : ViewOutlineProvider() {
+                    override fun getOutline(v: View, o: Outline) { o.setOval(0, 0, v.width, v.height) }
+                }
+                setImageBitmap(photo)
+            }
+        }
+        val nm = displayName()
+        val letter = nm.firstOrNull { it.isLetterOrDigit() }?.uppercaseChar()?.toString() ?: "?"
+        val palette = intArrayOf(0xFF5B6EE1.toInt(), 0xFF3FA796.toInt(), 0xFFB5651D.toInt(), 0xFF9B59B6.toInt(), 0xFFC0504D.toInt())
+        val circle = palette[(nm.hashCode() and 0x7FFFFFFF) % palette.size]
+        return TextView(this).apply {
+            text = letter
+            textSize = 20f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setTypeface(typeface, Typeface.BOLD)
+            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(circle) }
+        }
+    }
 
     @Suppress("DEPRECATION", "MissingPermission")
     private fun acceptCall() {
@@ -1006,23 +1157,42 @@ class IslandService : Service() {
         try { getSystemService(TelecomManager::class.java).endCall() } catch (_: Exception) {}
     }
 
-    private fun endDemo() { demoCall = false; callState = 0; render() }
+    private fun endDemo() {
+        demoCall = false
+        callState = 0
+        contactName = null
+        callerNumber = null
+        callerPhoto = null
+        render()
+    }
 
     fun demoIncomingCall() {
         handler.post {
             demoCall = true
+            contactName = "Test Caller"
+            callerNumber = "+263771234567"
+            callerPhoto = null
             callState = 1
             render()
             handler.postDelayed({ if (demoCall) endDemo() }, 8000)
         }
     }
 
+    private fun callHead(sub: View?): View {
+        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        head.addView(avatar(), LinearLayout.LayoutParams(dp(48), dp(48)))
+        val info = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        if (sub != null) info.addView(sub)
+        info.addView(tv(displayName(), 19f, Color.WHITE, true))
+        val num = if (contactName != null) prettyNumber(callerNumber) else null
+        if (num != null) info.addView(tv(num, 13f, GREY))
+        head.addView(info, LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginStart = dp(12) })
+        return head
+    }
+
     private fun callRing(): View {
         val col = column()
-        val top = FrameLayout(this)
-        top.addView(tv("Incoming call", 12f, GREY), lpf(WRAP, WRAP, Gravity.START or Gravity.CENTER_VERTICAL))
-        col.addView(top, llp(MATCH, cutH))
-        col.addView(tv(name(), 20f, Color.WHITE, true), llp(MATCH, WRAP, dp(4)))
+        col.addView(callHead(tv("Incoming call", 12f, GREY)), llp(MATCH, dp(48)))
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         row.addView(pillBtn("Decline", RED) { endCall() },
             LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(6) })
@@ -1045,11 +1215,7 @@ class IslandService : Service() {
 
     private fun callActiveExpanded(): View {
         val col = column()
-        val top = FrameLayout(this)
-        top.addView(tv("On call", 12f, GREY), lpf(WRAP, WRAP, Gravity.START or Gravity.CENTER_VERTICAL))
-        top.addView(chrono(13f), lpf(WRAP, WRAP, Gravity.END or Gravity.CENTER_VERTICAL))
-        col.addView(top, llp(MATCH, cutH))
-        col.addView(tv(name(), 20f, Color.WHITE, true), llp(MATCH, WRAP, dp(4)))
+        col.addView(callHead(chrono(13f)), llp(MATCH, dp(48)))
         col.addView(pillBtn("End call", RED) { endCall() }, llp(MATCH, dp(44), dp(12)))
         return col
     }
@@ -1100,14 +1266,18 @@ class IslandService : Service() {
 
     private fun notifExpanded(): View {
         val n = notif
-        val col = column()
-        val top = FrameLayout(this)
-        top.addView(appIcon(n?.pkg, dp(7)), lpf(dp(26), dp(26), Gravity.START or Gravity.CENTER_VERTICAL))
-        top.addView(tv(n?.label, 12f, GREY), lpf(WRAP, WRAP, Gravity.END or Gravity.CENTER_VERTICAL))
-        col.addView(top, llp(MATCH, cutH))
-        col.addView(tv(n?.title, 16f, Color.WHITE, true), llp(MATCH, WRAP, dp(6)))
-        col.addView(tv(n?.text, 14f, 0xFFD0D0D4.toInt(), false, 2), llp(MATCH, WRAP, dp(2)))
-        return col
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+        }
+        row.addView(appIcon(n?.pkg, dp(10)), LinearLayout.LayoutParams(dp(42), dp(42)))
+        val info = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        info.addView(tv(n?.label?.uppercase(), 11f, GREY))
+        info.addView(tv(n?.title, 15f, Color.WHITE, true))
+        info.addView(tv(n?.text, 13f, 0xFFD0D0D4.toInt(), false, 2))
+        row.addView(info, LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginStart = dp(12) })
+        return row
     }
 
     // ---------------------------------------------------------------- second bubble (like iOS split island)
@@ -1149,8 +1319,9 @@ class IslandService : Service() {
         val l = blp ?: return
         val b = bubble ?: return
         if (!bubbleOn) return
-        l.x = lp.width / 2 + dp(6) + l.width / 2
-        l.y = cutTop
+        val half = (if (expanded) idleW() else lp.width) / 2
+        l.x = offX + half + dp(6) + l.width / 2
+        l.y = baseY()
         try { wm.updateViewLayout(b, l) } catch (_: Exception) {}
     }
 
